@@ -1,0 +1,173 @@
+---
+name: Build and Deploy
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  HARBOR_REGISTRY: harbor.208.haist.farm
+  IMAGE_NAME: sentinel/tiny-shortener
+  GITOPS_DEPLOY_FILE: apps/tiny-shortener/deployment.yaml
+
+jobs:
+  scan:
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: iac-buildah
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gitleaks secret detection
+        run: |
+          set -euo pipefail
+          gitleaks detect --source . --report-format json --report-path gitleaks-report.json --no-git
+          echo "Gitleaks: no secrets detected."
+
+      - name: OSV-Scanner (lockfile vulnerabilities)
+        run: |
+          set -euo pipefail
+          if ! command -v osv-scanner >/dev/null 2>&1; then
+            echo "::error::osv-scanner not installed on iac runner"
+            exit 1
+          fi
+          # --recursive scans every lockfile in the tree (requirements.txt,
+          # package-lock.json, etc.). Exit 0 even when vulns are found —
+          # they should ANNOTATE the PR (out of scope: OPS-266) but not
+          # block merge yet. Hard-fail policy is a follow-up issue.
+          osv-scanner --format table --recursive . || {
+            echo "::warning::osv-scanner reported findings — review log above"
+          }
+
+      - name: Trivy filesystem scan (misconfig + vulns)
+        run: |
+          set -euo pipefail
+          if ! command -v trivy >/dev/null 2>&1; then
+            echo "::error::trivy not installed on iac runner"
+            exit 1
+          fi
+          # fs scan covers IaC misconfigs, vulnerable deps in lockfiles,
+          # and Dockerfile-level smells. Severity HIGH,CRITICAL only;
+          # non-blocking (matches existing image-time policy on line ~64).
+          trivy fs --severity HIGH,CRITICAL --format table . || true
+
+      - name: Upload scan artifacts
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: pr-scan-${{ github.run_id }}
+          path: |
+            gitleaks-report.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  build-and-push:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: iac-buildah
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        run: |
+          IMAGE_TAG="$(echo $GITHUB_SHA | cut -c1-7)"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+          echo "Image tag: $IMAGE_TAG"
+
+      - name: Build container image
+        run: |
+          echo "Building $HARBOR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+          buildah bud -t "$HARBOR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG" .
+
+      - name: Push to Harbor
+        id: push
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          buildah login --username "$HARBOR_USERNAME" --password "$HARBOR_PASSWORD" "$HARBOR_REGISTRY"
+          buildah push --digestfile /tmp/digest.txt "$HARBOR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+          DIGEST="$(cat /tmp/digest.txt)"
+          echo "Pushed: $HARBOR_REGISTRY/$IMAGE_NAME@$DIGEST"
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+
+      # OPS-748: Vendor security-scan composite locally (Pattern A) to fix cross-repo
+      # action resolution failure. Cross-repo @SHA reference caused immediate job-init
+      # failures. Vendored copy = sentinel-iac main as of 2026-05-18.
+      # OPS-1210: write ~/.docker/config.json from Harbor robot creds BEFORE the
+      # security-scan composite, so syft (composite step 1) can pull the private
+      # image to build the SBOM. syft uses go-containerregistry's keychain
+      # (~/.docker/config.json); the composite's own auth bridge only runs at the
+      # cosign step (later), so without this syft pulls anonymously -> 401.
+      - name: Bridge Harbor creds to docker config (for syft pull)
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.docker"
+          AUTH=$(printf '%s:%s' "$HARBOR_USERNAME" "$HARBOR_PASSWORD" | base64 -w0)
+          printf '{"auths":{"%s":{"auth":"%s"}}}' "$HARBOR_REGISTRY" "$AUTH" > "$HOME/.docker/config.json"
+          chmod 600 "$HOME/.docker/config.json"
+          echo "wrote ~/.docker/config.json for $HARBOR_REGISTRY"
+
+      - name: Supply-chain security scan (SBOM + SLSA + OSV + sign)
+        uses: ./.forgejo/actions/security-scan
+        with:
+          image-ref: ${{ env.HARBOR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          language: go
+          source-dir: .
+          defectdojo-product-name: "Tiny URL Shortener"
+          defectdojo-token: ${{ secrets.DEFECTDOJO_API_KEY }}
+          cosign-key: ${{ secrets.COSIGN_KEY }}
+          cosign-password: ${{ secrets.COSIGN_PASSWORD || '' }}
+          upload-sbom: "true"
+          hard-fail-on-critical: "false"
+
+      # OPS-707: pass Harbor credentials via --registry-username/--registry-password to
+      # bridge the buildah→go-containerregistry keychain gap. buildah login writes to
+      # containers/auth.json; cosign uses go-containerregistry which reads
+      # ~/.docker/config.json. These are different credential stores. Without explicit
+      # creds, Harbor's OCI 1.1 Referrers API returns 401 → "no signatures found".
+      - name: Verify cosign signature
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          cosign verify --key /etc/cosign/cosign.pub \
+            --registry-username "$HARBOR_USERNAME" \
+            --registry-password "$HARBOR_PASSWORD" \
+            "$HARBOR_REGISTRY/$IMAGE_NAME@${{ steps.push.outputs.digest }}"
+          echo "Signature verified"
+
+      - name: Trivy scan (non-blocking)
+        run: |
+          trivy image --severity HIGH,CRITICAL --format table \
+            "$HARBOR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG" || true
+
+      - name: Update GitOps (digest-pin)
+        if: ${{ steps.push.outputs.digest != '' }}
+        env:
+          FORGEJO_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          git config --global user.name "Sentinel CI"
+          git config --global user.email "ci@haist.farm"
+          REPO_URL="https://sentinel-admin:${FORGEJO_TOKEN}@forgejo.208.haist.farm/sentinel-admin/overwatch-gitops.git"
+          rm -rf /tmp/gitops
+          git clone --depth 1 --branch main "$REPO_URL" /tmp/gitops
+          cd /tmp/gitops
+          if [ ! -f "$GITOPS_DEPLOY_FILE" ]; then
+            echo "::warning::$GITOPS_DEPLOY_FILE not present yet — skipping digest pin until gitops manifests are merged"
+            exit 0
+          fi
+          sed -i -E "s#(image: ${HARBOR_REGISTRY}/${IMAGE_NAME})(@sha256:[0-9a-f]+|:[^[:space:]\"']+)#\1@${DIGEST}#g" "$GITOPS_DEPLOY_FILE"
+          if git diff --quiet; then echo "digest already current"; exit 0; fi
+          git add "$GITOPS_DEPLOY_FILE"
+          git commit -m "[ci] Update ${IMAGE_NAME} to ${DIGEST}"
+          for i in 1 2 3; do
+            if git push origin main; then echo "pinned ${DIGEST}"; exit 0; fi
+            git pull --rebase origin main
+          done
+          echo "::error::push failed after retries"; exit 1
